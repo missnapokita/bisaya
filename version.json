@@ -1,6 +1,6 @@
 {
-  "version_code": 4,
-  "version_name": "1.1.0",
+  "version_code": 6,
+  "version_name": "1.0",
   "title": "Bisaya Toolkit Update Available",
   "message": "Added 2 new Features!",
   "changelog": [
@@ -9,6 +9,6 @@
     "Fix App Bugs & Errors"
   ],
   "download_url": "https://play.google.com/store/apps/details?id=com.bisayatoolkit.ph",
-  "update_size": "18 MB",
+  "update_size": "6 MB",
   "force_update": true
 }
