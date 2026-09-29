@@ -1,0 +1,93 @@
+# Managed by GitHub Files Uploader. Do not rename this workflow.
+name: GitHub Files Uploader - Large File
+run-name: Large upload - ${{ github.event.client_payload.job_id }}
+on:
+  repository_dispatch:
+    types: [ghfu-large-upload-v2]
+permissions:
+  contents: write
+concurrency:
+  group: ghfu-large-${{ github.event.client_payload.path_key }}
+  cancel-in-progress: false
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Assemble uploaded chunks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          from pathlib import Path
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text("utf-8"))
+          payload = event["client_payload"]
+          target = Path(str(payload["path"]))
+          job_id = str(payload["job_id"])
+          parts = payload["parts"]
+          expected_size = int(payload["size"])
+
+          if (not target.parts or target.is_absolute() or ".." in target.parts
+                  or target.parts[0] == ".git"):
+              raise SystemExit("Unsafe target path")
+          if not re.fullmatch(r"[a-z0-9-]{8,80}", job_id):
+              raise SystemExit("Invalid upload job")
+          if not isinstance(parts, list) or not parts:
+              raise SystemExit("No uploaded chunks")
+          if expected_size < 0 or expected_size > 100 * 1024 * 1024:
+              raise SystemExit("File exceeds GitHub's 100 MiB limit")
+
+          target.parent.mkdir(parents=True, exist_ok=True)
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          total = 0
+          with target.open("wb") as output:
+              for sha in parts:
+                  if not re.fullmatch(r"[0-9a-f]{40,64}", str(sha)):
+                      raise SystemExit("Invalid chunk identifier")
+                  request = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/git/blobs/{sha}",
+                      headers={
+                          "Accept": "application/vnd.github.raw+json",
+                          "Authorization": f"Bearer {token}",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=120) as response:
+                      while True:
+                          chunk = response.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          output.write(chunk)
+                          total += len(chunk)
+                          if total > expected_size:
+                              raise SystemExit("Uploaded chunks exceed expected size")
+
+          if total != expected_size:
+              target.unlink(missing_ok=True)
+              raise SystemExit(f"Size mismatch: expected {expected_size}, got {total}")
+
+          result = Path(".ghfu-results") / f"{job_id}.json"
+          result.parent.mkdir(parents=True, exist_ok=True)
+          result.write_text(json.dumps({"path": str(target), "size": total}), "utf-8")
+          PY
+      - name: Commit uploaded file
+        env:
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+          UPLOAD_PATH: ${{ github.event.client_payload.path }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          RESULT_PATH=".ghfu-results/$JOB_ID.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$UPLOAD_PATH" "$RESULT_PATH"
+          git commit -m "Upload $UPLOAD_PATH"
+          git pull --rebase origin "$TARGET_BRANCH"
+          git push origin "HEAD:$TARGET_BRANCH"
