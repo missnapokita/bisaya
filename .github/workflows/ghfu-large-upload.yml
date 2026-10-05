@@ -14,80 +14,117 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Check out default branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
-      - name: Assemble uploaded chunks
+      - name: Download in parallel and commit without a full checkout
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          python3 - <<'PY'
-          import json, os, re, urllib.request
-          from pathlib import Path
-
+          python3 - <<'PYTHON'
+          import base64, hashlib, json, os, re, shutil, subprocess, tempfile, time, urllib.request, urllib.error
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path, PurePosixPath
+          
           event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text("utf-8"))
           payload = event["client_payload"]
-          target = Path(str(payload["path"]))
+          path = str(payload["path"])
+          target = PurePosixPath(path)
           job_id = str(payload["job_id"])
           parts = payload["parts"]
-          expected_size = int(payload["size"])
-
+          size = int(payload["size"])
           if (not target.parts or target.is_absolute() or ".." in target.parts
-                  or target.parts[0] == ".git"):
+                  or ".git" in target.parts or target.parts[0] == ".ghfu-results"
+                  or path != str(target) or "\x00" in path):
               raise SystemExit("Unsafe target path")
           if not re.fullmatch(r"[a-z0-9-]{8,80}", job_id):
-              raise SystemExit("Invalid upload job")
-          if not isinstance(parts, list) or not parts:
-              raise SystemExit("No uploaded chunks")
-          if expected_size < 0 or expected_size > 100 * 1024 * 1024:
+              raise SystemExit("Invalid job identifier")
+          if (not isinstance(parts, list) or not 1 <= len(parts) <= 100
+                  or not all(re.fullmatch(r"[0-9a-f]{40}", str(p)) for p in parts)):
+              raise SystemExit("Invalid chunks")
+          if not 0 < size <= 100 * 1024 * 1024:
               raise SystemExit("File exceeds GitHub's 100 MiB limit")
-
-          target.parent.mkdir(parents=True, exist_ok=True)
-          token = os.environ["GH_TOKEN"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          total = 0
-          with target.open("wb") as output:
-              for sha in parts:
-                  if not re.fullmatch(r"[0-9a-f]{40,64}", str(sha)):
-                      raise SystemExit("Invalid chunk identifier")
-                  request = urllib.request.Request(
-                      f"https://api.github.com/repos/{repo}/git/blobs/{sha}",
-                      headers={
-                          "Accept": "application/vnd.github.raw+json",
-                          "Authorization": f"Bearer {token}",
-                          "X-GitHub-Api-Version": "2022-11-28",
-                      },
-                  )
-                  with urllib.request.urlopen(request, timeout=120) as response:
-                      while True:
-                          chunk = response.read(1024 * 1024)
-                          if not chunk:
-                              break
-                          output.write(chunk)
-                          total += len(chunk)
-                          if total > expected_size:
-                              raise SystemExit("Uploaded chunks exceed expected size")
-
-          if total != expected_size:
-              target.unlink(missing_ok=True)
-              raise SystemExit(f"Size mismatch: expected {expected_size}, got {total}")
-
-          result = Path(".ghfu-results") / f"{job_id}.json"
-          result.parent.mkdir(parents=True, exist_ok=True)
-          result.write_text(json.dumps({"path": str(target), "size": total}), "utf-8")
-          PY
-      - name: Commit uploaded file
-        env:
-          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
-          UPLOAD_PATH: ${{ github.event.client_payload.path }}
-          JOB_ID: ${{ github.event.client_payload.job_id }}
-        run: |
-          RESULT_PATH=".ghfu-results/$JOB_ID.json"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- "$UPLOAD_PATH" "$RESULT_PATH"
-          git commit -m "Upload $UPLOAD_PATH"
-          git pull --rebase origin "$TARGET_BRANCH"
-          git push origin "HEAD:$TARGET_BRANCH"
+          token = os.environ["GH_TOKEN"]
+          branch = os.environ["TARGET_BRANCH"]
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+          with tempfile.TemporaryDirectory(prefix="ghfu-") as directory:
+              work = Path(directory)
+              def download(entry):
+                  index, sha = entry
+                  local = work / f"part-{index}"
+                  for attempt in range(4):
+                      try:
+                          request = urllib.request.Request(f"{api}/repos/{repo}/git/blobs/{sha}", headers={
+                              "Accept": "application/vnd.github.raw+json",
+                              "Authorization": f"Bearer {token}",
+                              "X-GitHub-Api-Version": "2022-11-28"})
+                          count = 0
+                          with urllib.request.urlopen(request, timeout=120) as response, local.open("wb") as output:
+                              while chunk := response.read(1024 * 1024):
+                                  count += len(chunk)
+                                  if count > min(size, 8 * 1024 * 1024):
+                                      raise ValueError("Chunk exceeds size limit")
+                                  output.write(chunk)
+                          digest = hashlib.sha1(f"blob {count}\0".encode())
+                          with local.open("rb") as source:
+                              while chunk := source.read(1024 * 1024):
+                                  digest.update(chunk)
+                          if digest.hexdigest() != sha:
+                              raise ValueError("Chunk integrity check failed")
+                          print(f"Downloaded chunk {index + 1}/{len(parts)}", flush=True)
+                          return local, count
+                      except (urllib.error.URLError, TimeoutError, OSError) as error:
+                          if isinstance(error, urllib.error.HTTPError) and error.code not in (403, 429, 500, 502, 503, 504):
+                              raise
+                          if attempt == 3:
+                              raise
+                          wait = 2 ** attempt
+                          if isinstance(error, urllib.error.HTTPError):
+                              wait = min(60, max(wait, int(error.headers.get("Retry-After", "0") or 0)))
+                          time.sleep(wait)
+              assembled = work / "assembled"
+              total = 0
+              with ThreadPoolExecutor(max_workers=min(6, len(parts))) as pool, assembled.open("wb") as output:
+                  for local, count in pool.map(download, enumerate(parts)):
+                      total += count
+                      if total > size:
+                          raise SystemExit("Uploaded chunks exceed expected size")
+                      with local.open("rb") as source:
+                          shutil.copyfileobj(source, output, 1024 * 1024)
+                      local.unlink()
+              if total != size:
+                  raise SystemExit(f"Size mismatch: expected {size}, got {total}")
+              # Fetch only the latest commit and trees. Never download repository files/history.
+              gitdir = work / "repo"
+              gitdir.mkdir()
+              def git(*args, input=None, check=True):
+                  return subprocess.run(["git", *args], cwd=gitdir, input=input, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+              git("init", "-q")
+              git("remote", "add", "origin", f"{server}/{repo}.git")
+              git("config", "remote.origin.promisor", "true")
+              git("config", "remote.origin.partialclonefilter", "blob:none")
+              git("config", "user.name", "github-actions[bot]")
+              git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+              auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+              git("config", f"http.{server}/.extraheader", f"AUTHORIZATION: basic {auth}")
+              blob = git("hash-object", "-w", "--", str(assembled)).stdout.strip()
+              marker = f".ghfu-results/{job_id}.json"
+              marker_blob = git("hash-object", "-w", "--stdin", input=json.dumps({"path": path, "size": size, "sha": blob})).stdout.strip()
+              for attempt in range(4):
+                  git("fetch", "--quiet", "--depth=1", "--filter=blob:none", "origin", branch)
+                  parent = git("rev-parse", "FETCH_HEAD").stdout.strip()
+                  git("read-tree", parent)
+                  git("update-index", "--add", "--cacheinfo", "100644", blob, path)
+                  git("update-index", "--add", "--cacheinfo", "100644", marker_blob, marker)
+                  tree = git("write-tree").stdout.strip()
+                  commit = git("commit-tree", tree, "-p", parent, input=f"Upload {path}\n").stdout.strip()
+                  pushed = git("push", "--quiet", "origin", f"{commit}:refs/heads/{branch}", check=False)
+                  if pushed.returncode == 0:
+                      print("Upload committed successfully", flush=True)
+                      break
+                  if attempt == 3:
+                      raise SystemExit("Could not push upload; check branch protection and Actions write permission")
+                  # Rebuild from the latest tree so concurrent uploads/edits are preserved.
+                  time.sleep(1 + attempt)
+          PYTHON
